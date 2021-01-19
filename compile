@@ -1,0 +1,2 @@
+#!/bin/bash
+gcc -g -O2 -Wall -Werror -pedantic -I ../../liburing/src/include -L ../../liburing/src/ -o bench_event bench_event.c mcmc.c pcg-basic.c itoa_ljust.c -levent -lpthread -levent_pthreads -luring
