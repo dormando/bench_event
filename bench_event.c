@@ -48,6 +48,7 @@ typedef struct request {
     STAILQ_ENTRY(request) requests;
     mcmc_resp_t resp;
     char request_string[150];
+    bool flushed;
     size_t request_len;
     conn *c;
     backend *be;
@@ -59,6 +60,7 @@ typedef STAILQ_HEAD(req_head_s, request) req_head_t;
 // mcmc client
 struct _backend {
     bool connecting;
+    bool stacked; // if stacked for a bg run already.
     struct event *read_event;
     struct event *write_event;
     struct event *timeout_event;
@@ -67,10 +69,14 @@ struct _backend {
     char *buf; // dedicated read buffer per backend.
     void *client; // mcmc client.
     event_thread *evthr; // event thread owning this backend.
+    STAILQ_ENTRY(_backend) be_next; // for work queue.
     pthread_mutex_t mutex;
     int depth; // run under mutex.
     req_head_t req_head;
 };
+// TODO: think we actually want a TAILQ for this one?
+// _REMOVE() loops.
+typedef STAILQ_HEAD(be_head_s, _backend) be_head_t;
 
 // emulate a connection within a submission thread
 struct _conn {
@@ -92,6 +98,13 @@ struct _submit_thread {
     pthread_mutex_t mutex;
 };
 
+typedef struct {
+    pthread_t thread_id;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    event_thread *evthr;
+} backend_thread;
+
 struct _event_thread {
     pthread_t thread_id;
     int notify_receive_fd;
@@ -102,18 +115,12 @@ struct _event_thread {
     struct event *notify_event;
     struct timeval default_timeout;
     pthread_mutex_t req_mutex;
+    pthread_cond_t cond;
     req_head_t req_head;
+    be_head_t be_head; // stack of backends to broadcast.
+    backend_thread *be_threads;
 };
 
-// if all this thread does is submit the queue, we can listen on a condition
-// notify instead of the uring.
-typedef struct {
-    pthread_t thread_id;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    struct io_uring ring;
-    STAILQ_HEAD(stailq_req_readhead, request) req_readhead;
-} backend_thread;
 
 static void submit_requests(submit_thread *t, conn *c) {
     // BUG: need to write all requests at once...
@@ -271,15 +278,45 @@ static void *event_thread_run(void *arg) {
     return NULL;
 }
 
-// NOTE: unused.
+// fan out from event thread.
 static void *backend_thread_run(void *arg) {
     backend_thread *t = arg;
+    pthread_mutex_lock(&t->mutex);
     while (1) {
-        pthread_mutex_lock(&t->mutex);
-        if (STAILQ_EMPTY(&t->req_readhead)) {
+        event_thread *ev = t->evthr;
+        pthread_mutex_lock(&ev->req_mutex);
+        if (STAILQ_EMPTY(&ev->be_head)) {
+            pthread_cond_signal(&ev->cond);
+            pthread_mutex_unlock(&ev->req_mutex);
             pthread_cond_wait(&t->cond, &t->mutex);
+            continue;
         }
-        pthread_mutex_unlock(&t->mutex);
+
+        // Got a backend to process.
+        backend *be = STAILQ_FIRST(&ev->be_head);
+        STAILQ_REMOVE_HEAD(&ev->be_head, be_next);
+        pthread_mutex_unlock(&ev->req_mutex);
+
+        // FIXME: backend mutex might not be necessary.
+        pthread_mutex_lock(&be->mutex);
+        be->stacked = false;
+
+        assert(be->connecting == false);
+        struct request *r;
+        // FIXME: add another queue so we don't have to loop past stuff that
+        // was written already?
+        STAILQ_FOREACH(r, &be->req_head, requests) {
+            if (r->flushed) {
+                continue;
+            }
+            int status = mcmc_send_request(be->client, r->request_string, r->request_len, 1);
+            if (status == MCMC_WANT_WRITE) {
+                assert(1 == 0);
+            }
+            r->flushed = true;
+        }
+
+        pthread_mutex_unlock(&be->mutex);
     }
     return NULL;
 }
@@ -288,12 +325,24 @@ static void backend_timeout_handler(int fd, short which, void *arg) {
     assert(1 == 0);
 }
 
+// NOTE:
+// This externalizes the write syscalls from worker threads:
+// - worker threads stack requests
+// - pass to event thread
+// - event thread runs batches of requests and executes fan-out
+// - event thread then safely runs read events.
+// for speedup, a step 1:
+// - bg threads collect iovec's, run batched writes.
+// io_uring, a step 2:
+// - instead bg threads, iovecs are directly gathered into SQE's, executed,
+// then write results checked inline before further reads.
 static void backend_notify_handler(int fd, short which, void *arg) {
     event_thread *me = arg;
     char buf[1];
     // active work queue.
     req_head_t head;
     STAILQ_INIT(&head);
+    STAILQ_INIT(&me->be_head);
 
     if (use_eventfd) {
         uint64_t u;
@@ -316,27 +365,70 @@ static void backend_notify_handler(int fd, short which, void *arg) {
     // TODO: with extra tracking, we can gather larger writes if a be has many
     // outstanding writes... but this will require tracking and re-looping all
     // backends?
+    int be_count = 0;
+    int req_count = 0;
     while(!STAILQ_EMPTY(&head)) {
         // - pull and lock backend.
         struct request *r = STAILQ_FIRST(&head);
+        r->flushed = false;
         backend *be = r->be;
+        // NOTES:
+        // - if backend not queued, add to local queue
+        // - roll all recs.
+        //  - can assemble an iovec during this pass.
+        // - at end of stack loop from backends for dispatch
+        //  - keep counter for # of queued backends
+        //  - wake BG threads up to depth
+        //  - BG threads lock BE stack, pop, do work
+        //   - move finished BE's to outbound queue?
+        //   - think they can be dropped since we're just waiting for read
+        //     events now?
+        //   - actually no.. can only be dropped if work complete.
+        //     re-queue for any WANT_WRITES/errors/etc.
+        //  - if queue empty, signal event thread
+        //  - issue: ev thread is idle at this time.
+        // -------------
+        // - could run tests maybe... wake per res BE vs full batch.
+        //  - keeps thread busier, might have better latency?
+        // - letting the reads run causes the same race condition tho.
         pthread_mutex_lock(&be->mutex);
         // TODO: handle WANT_WRITE / write failures.
         // - if be is writable, run write
         //  - if write fails, mark !writable
         //  - assign write event to event thread.
-        assert(be->connecting == false);
-        int status = mcmc_send_request(be->client, r->request_string, r->request_len, 1);
-        if (status == MCMC_WANT_WRITE) {
-            assert(1 == 0);
-        }
         // - either way, stack request to be tail
         // have to remove from local head before inserting to *be tail.
         STAILQ_REMOVE_HEAD(&head, requests);
         STAILQ_INSERT_TAIL(&be->req_head, r, requests);
         be->depth++;
+        req_count++;
+        if (!be->stacked) {
+            be->stacked = true;
+            STAILQ_INSERT_TAIL(&me->be_head, be, be_next);
+            be_count++;
+        }
         pthread_mutex_unlock(&be->mutex);
     }
+
+    // requests are now stacked into per-backend queues.
+    // we do this here to avoid worker threads blocking on backend mutexes
+    // while flushing write syscalls.
+    //fprintf(stderr, "signalling: %d [%d]\n", be_count, req_count);
+    for (int x = 0; x < threads_backend; x++) {
+        backend_thread *bt = &me->be_threads[x];
+        pthread_cond_signal(&bt->cond);
+        if (x == be_count)
+            break;
+    }
+
+    // TODO: different mutex?
+    pthread_mutex_lock(&me->req_mutex);
+    if (!STAILQ_EMPTY(&me->be_head)) {
+        pthread_cond_wait(&me->cond, &me->req_mutex);
+    }
+    pthread_mutex_unlock(&me->req_mutex);
+
+    // TODO: re-lock and check inbound queue for WANT_WRITE/error/etc.
 }
 
 static void backend_read_handler(int fd, short which, void *arg) {
@@ -438,6 +530,8 @@ static void setup_libevent_bench(int submit_mode) {
 
     // thread[s] for libevent
     event_thread *e_threads = calloc(threads_event, sizeof(event_thread));
+    // threads for backend write syscalls.
+    backend_thread *b_threads = calloc(threads_backend, sizeof(backend_thread));
     // threads for submissions
     submit_thread *s_threads = calloc(threads_submit, sizeof(submit_thread));
     for (int i = 0; i < threads_submit; i++) {
@@ -467,6 +561,12 @@ static void setup_libevent_bench(int submit_mode) {
     for (int i = 0; i < threads_event; i++) {
         event_thread *t = &e_threads[i];
 
+        // FIXME: probably need a set of these _per_ event thread.
+        // test will only work with 1 libevent thread for now.
+        t->be_threads = b_threads;
+        for (int x = 0; x < threads_backend; x++) {
+            t->be_threads[x].evthr = t;
+        }
         struct event_config *ev_config;
         ev_config = event_config_new();
         if (submit_mode == SUBMIT_MODE_WORKER_TIMERS) {
@@ -546,13 +646,13 @@ static void setup_libevent_bench(int submit_mode) {
         }
 
         pthread_mutex_init(&t->req_mutex, NULL);
+        pthread_cond_init(&t->cond, NULL);
         STAILQ_INIT(&t->req_head);
         pthread_create(&t->thread_id, NULL, event_thread_run, t);
     }
 
     // threads for backend handling
     // NOTE: unused.
-    backend_thread *b_threads = calloc(threads_backend, sizeof(backend_thread));
     for (int i = 0; i < threads_backend; i++) {
         backend_thread *t = &b_threads[i];
         pthread_mutex_init(&t->mutex, NULL);
@@ -819,10 +919,7 @@ static void setup_uring_bench(void) {
     }
 
     // threads for backend handling
-    // TODO:
-    // - init STAILQ
-    // - init ring
-    // - that's it?
+    // FIXME: probably unused for uring.
     backend_thread *b_threads = calloc(threads_backend, sizeof(backend_thread));
     for (int i = 0; i < threads_backend; i++) {
         backend_thread *t = &b_threads[i];
@@ -846,6 +943,7 @@ int main (int argc, char *argv[]) {
         "n:" // backend connections per event thread
         "t:" // type of test to run
         "f"  // use eventfd instead of notify pipe.
+        "q:" // number of submit threads.
         ;
     while ((opt = getopt(argc, argv, shortopts)) != -1) {
         switch (opt) {
@@ -866,6 +964,9 @@ int main (int argc, char *argv[]) {
                 break;
             case 'n':
                 backend_conns = atoi(optarg);
+                break;
+            case 'q':
+                threads_backend = atoi(optarg);
                 break;
             case 't':
                 if (optarg[0] == 'e') {
